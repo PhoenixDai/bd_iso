@@ -1,0 +1,363 @@
+import os
+import random
+import stat
+import subprocess
+from glob import glob
+
+
+OPTICAL_ALIAS_PATHS = (
+    "/dev/cdrom",
+    "/dev/dvd",
+    "/dev/bluray",
+    "/dev/bd",
+)
+TOUCH_READ_SIZE = 64 * 1024
+TOUCH_MAX_CANDIDATE_FILES = 512
+
+
+def is_optical_device_path(device_path):
+    if not device_path:
+        return False
+    normalized = os.path.realpath(device_path)
+    base_name = os.path.basename(normalized)
+    return (
+        device_path in OPTICAL_ALIAS_PATHS
+        or normalized in OPTICAL_ALIAS_PATHS
+        or base_name.startswith("sr")
+        or base_name.startswith("scd")
+    )
+
+
+def list_optical_drive_candidates():
+    candidates = []
+    seen = set()
+
+    for alias_path in OPTICAL_ALIAS_PATHS:
+        if os.path.exists(alias_path):
+            resolved = os.path.realpath(alias_path)
+            if resolved not in seen:
+                candidates.append(resolved)
+                seen.add(resolved)
+
+    for sysfs_path in sorted(glob("/sys/class/block/sr*")) + sorted(glob("/sys/class/block/scd*")):
+        device_name = os.path.basename(sysfs_path)
+        dev_path = os.path.join("/dev", device_name)
+        resolved = os.path.realpath(dev_path)
+        if os.path.exists(resolved) and resolved not in seen:
+            candidates.append(resolved)
+            seen.add(resolved)
+
+    for dev_path in sorted(glob("/dev/sr*")) + sorted(glob("/dev/scd*")):
+        resolved = os.path.realpath(dev_path)
+        if os.path.exists(resolved) and resolved not in seen:
+            candidates.append(resolved)
+            seen.add(resolved)
+
+    return candidates
+
+
+def get_block_device_size(device_path):
+    """
+    Returns the size of a Linux block device in bytes.
+
+    For tests and dry runs, regular files are also supported and their file
+    size is returned directly.
+    """
+    if os.name == "nt":
+        raise NotImplementedError("get_block_device_size is only implemented for Linux.")
+
+    try:
+        mode = os.stat(device_path).st_mode
+    except OSError as exc:
+        raise OSError(f"Could not stat source path {device_path!r}: {exc}") from exc
+
+    if stat.S_ISREG(mode):
+        return os.path.getsize(device_path)
+
+    last_error = None
+
+    try:
+        import fcntl
+        import struct
+
+        blkgetsize64 = 0x80081272
+        with open(device_path, "rb", buffering=0) as handle:
+            packed_size = fcntl.ioctl(handle.fileno(), blkgetsize64, b"\x00" * 8)
+        size = struct.unpack("Q", packed_size)[0]
+        if size > 0:
+            return size
+    except Exception as exc:
+        last_error = exc
+
+    block_name = os.path.basename(os.path.realpath(device_path))
+    sysfs_size_path = os.path.join("/sys/class/block", block_name, "size")
+
+    try:
+        with open(sysfs_size_path, "r", encoding="utf-8") as handle:
+            sectors = int(handle.read().strip(), 0)
+        size = sectors * 512
+        if size > 0:
+            return size
+    except Exception as exc:
+        if last_error is None:
+            last_error = exc
+
+    if stat.S_ISBLK(mode):
+        raise OSError(
+            f"Could not determine block device size for {device_path!r}: {last_error}"
+        )
+
+    return os.path.getsize(device_path)
+
+
+def auto_detect_optical_drive(preferred_path=None, expected_size=None):
+    candidate_paths = []
+    seen = set()
+
+    def add_candidate(path):
+        if not path:
+            return
+        resolved = os.path.realpath(path)
+        if resolved in seen or not os.path.exists(resolved):
+            return
+        seen.add(resolved)
+        candidate_paths.append(resolved)
+
+    if preferred_path and os.path.exists(preferred_path):
+        add_candidate(preferred_path)
+
+    for candidate in list_optical_drive_candidates():
+        add_candidate(candidate)
+
+    if expected_size is not None:
+        for candidate in candidate_paths:
+            try:
+                if get_block_device_size(candidate) == expected_size:
+                    return candidate
+            except Exception:
+                continue
+
+    if candidate_paths:
+        return candidate_paths[0]
+
+    raise OSError("No optical drive device could be auto-detected.")
+
+
+def resolve_source_path(source_path, expected_size=None):
+    if os.name == "nt":
+        return source_path
+
+    if source_path and os.path.exists(source_path):
+        return os.path.realpath(source_path)
+
+    if is_optical_device_path(source_path) or not source_path:
+        return auto_detect_optical_drive(
+            preferred_path=source_path,
+            expected_size=expected_size,
+        )
+
+    return os.path.realpath(source_path)
+
+
+def run_eject_command(device_path, *, close_tray=False):
+    resolved = resolve_source_path(device_path)
+    command = ["eject"]
+    if close_tray:
+        command.append("-t")
+    command.append(resolved)
+
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise OSError("The `eject` command was not found.") from exc
+    except subprocess.CalledProcessError as exc:
+        details = (exc.stderr or exc.stdout or "").strip()
+        if details:
+            raise OSError(details) from exc
+        raise OSError(f"`{' '.join(command)}` failed with exit code {exc.returncode}.") from exc
+
+    return completed.stdout.strip() or completed.stderr.strip()
+
+
+def eject_disc(device_path):
+    run_eject_command(device_path, close_tray=False)
+    return True
+
+
+def close_tray(device_path):
+    run_eject_command(device_path, close_tray=True)
+    return True
+
+
+def _decode_mount_field(value):
+    return (
+        value.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+    )
+
+
+def find_mount_points_for_source(source_path):
+    resolved_source = os.path.realpath(source_path)
+    mount_points = []
+
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return mount_points
+
+    for raw_line in lines:
+        parts = raw_line.split()
+        if len(parts) < 2:
+            continue
+        mounted_source = os.path.realpath(_decode_mount_field(parts[0]))
+        mount_point = _decode_mount_field(parts[1])
+        if mounted_source == resolved_source and os.path.isdir(mount_point):
+            mount_points.append(mount_point)
+
+    return mount_points
+
+
+def mount_source_device(source_path):
+    if os.name == "nt":
+        raise OSError("Automatic mounting is only supported on Linux.")
+
+    resolved = os.path.realpath(source_path)
+    commands = (
+        ["udisksctl", "mount", "-b", resolved],
+        ["mount", resolved],
+    )
+    errors = []
+
+    for command in commands:
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            errors.append(f"`{command[0]}` was not found")
+            continue
+        except subprocess.CalledProcessError as exc:
+            details = (exc.stderr or exc.stdout or "").strip()
+            if details:
+                errors.append(details)
+            else:
+                errors.append(
+                    f"`{' '.join(command)}` failed with exit code {exc.returncode}"
+                )
+            continue
+
+        mount_points = find_mount_points_for_source(resolved)
+        if mount_points:
+            return mount_points
+        errors.append(f"`{' '.join(command)}` completed but {resolved} is still not mounted")
+
+    details = "; ".join(errors) if errors else "no mount command succeeded"
+    raise OSError(f"Could not mount {resolved}: {details}")
+
+
+def _read_random_small_file(mount_point, *, rng=random, max_candidates=TOUCH_MAX_CANDIDATE_FILES):
+    candidates = []
+
+    for root, dirs, files in os.walk(mount_point):
+        dirs[:] = sorted(dirs)
+        for file_name in sorted(files):
+            path = os.path.join(root, file_name)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            if size <= 0:
+                continue
+            candidates.append(path)
+            if len(candidates) >= max_candidates:
+                break
+        if len(candidates) >= max_candidates:
+            break
+
+    if not candidates:
+        raise OSError(f"No readable files found under mounted disc {mount_point!r}.")
+
+    path = rng.choice(candidates)
+    with open(path, "rb") as handle:
+        data = handle.read(TOUCH_READ_SIZE)
+    if not data:
+        raise OSError(f"Read no data from {path!r}.")
+    return path, len(data)
+
+
+def touch_disc(device_path, *, expected_size=None, rng=random):
+    resolved = resolve_source_path(device_path, expected_size=expected_size)
+    mount_points = find_mount_points_for_source(resolved)
+    if not mount_points:
+        mount_points = mount_source_device(resolved)
+
+    errors = []
+    for mount_point in mount_points:
+        try:
+            path, byte_count = _read_random_small_file(mount_point, rng=rng)
+            return f"Read {byte_count} bytes from {path}"
+        except OSError as exc:
+            errors.append(str(exc))
+
+    details = "; ".join(errors) if errors else "no readable file found"
+    raise OSError(f"Could not touch mounted disc {resolved}: {details}")
+
+
+def open_bd_drive(bd_path):
+    """
+    Opens a BD drive for reading on Windows or Unix systems.
+
+    Args:
+        bd_path (str): The device path of the BD drive.
+                      On Windows: r'\\\\.\\D:' format
+                      On Unix: '/dev/sr0' format
+
+    Returns:
+        file: A file object opened in binary read mode.
+
+    Raises:
+        PermissionError: If access is denied (Windows).
+        OSError: If the drive cannot be opened.
+    """
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x80
+
+        handle = ctypes.windll.kernel32.CreateFileW(
+            bd_path,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+
+        if handle == -1 or handle == 0xFFFFFFFF or handle == 18446744073709551615:
+            err = ctypes.GetLastError()
+            if err == 5:
+                raise PermissionError("Access is denied. Please run as Administrator.")
+            raise OSError(f"Error opening drive (WinError {err}).")
+
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+        return os.fdopen(fd, "rb")
+
+    bd_path = resolve_source_path(bd_path)
+    return open(bd_path, "rb")

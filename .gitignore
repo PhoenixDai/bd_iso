@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.codex
+.vscode/
+output/
+*.iso
+*.iso.*
