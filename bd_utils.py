@@ -58,14 +58,14 @@ def list_optical_drive_candidates():
 
 def get_block_device_size(device_path):
     """
-    Returns the size of a Linux block device in bytes.
+    Returns the size of a block device in bytes.
+
+    On Windows, uses CreateFileW + DeviceIoControl (IOCTL_DISK_GET_LENGTH_INFO).
+    On Linux, uses fcntl.ioctl (BLKGETSIZE64) with a sysfs fallback.
 
     For tests and dry runs, regular files are also supported and their file
     size is returned directly.
     """
-    if os.name == "nt":
-        raise NotImplementedError("get_block_device_size is only implemented for Linux.")
-
     try:
         mode = os.stat(device_path).st_mode
     except OSError as exc:
@@ -73,6 +73,57 @@ def get_block_device_size(device_path):
 
     if stat.S_ISREG(mode):
         return os.path.getsize(device_path)
+
+    if os.name == "nt":
+        import ctypes
+
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x80
+        IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
+
+        handle = ctypes.windll.kernel32.CreateFileW(
+            device_path,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+
+        if handle in (-1, 0xFFFFFFFF, 18446744073709551615):
+            err = ctypes.GetLastError()
+            if err == 5:
+                raise PermissionError(
+                    "Access is denied. Please run as Administrator "
+                    "to query block device size."
+                )
+            raise OSError(f"Error opening device (WinError {err}).")
+
+        try:
+            length_info = ctypes.c_uint64(0)
+            bytes_returned = ctypes.c_uint32(0)
+            success = ctypes.windll.kernel32.DeviceIoControl(
+                handle,
+                IOCTL_DISK_GET_LENGTH_INFO,
+                None,
+                0,
+                ctypes.byref(length_info),
+                ctypes.sizeof(length_info),
+                ctypes.byref(bytes_returned),
+                None,
+            )
+            if not success:
+                raise ctypes.WinError()
+            size = length_info.value
+            if size > 0:
+                return size
+            raise OSError("DeviceIoControl returned disk length 0.")
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
 
     last_error = None
 
@@ -160,6 +211,14 @@ def resolve_source_path(source_path, expected_size=None):
 
 
 def run_eject_command(device_path, *, close_tray=False):
+    if os.name == "nt":
+        try:
+            _windows_drive_root(device_path)
+        except OSError:
+            pass
+        else:
+            return _run_eject_windows(device_path, close_tray=close_tray)
+
     resolved = resolve_source_path(device_path)
     command = ["eject"]
     if close_tray:
@@ -194,6 +253,97 @@ def close_tray(device_path):
     return True
 
 
+def _windows_drive_root(device_path):
+    """Extract a drive-letter root from a Windows device path.
+
+    ``\\\\.\\D:``  →  ``D:\\``
+    ``D:``         →  ``D:\\``
+    ``D``          →  ``D:\\``
+    ``D:\\``       →  ``D:\\``
+    """
+    stripped = device_path.strip()
+    # Remove the \\\\.\\ prefix if present
+    if stripped.startswith("\\\\.\\"):
+        stripped = stripped[4:]
+    # Extract the drive letter
+    drive_letter = stripped.lstrip("\\").lstrip("/").rstrip(":\\/").strip(":")
+    if len(drive_letter) == 1 and drive_letter.isalpha():
+        return f"{drive_letter.upper()}:\\"
+    raise OSError(f"Could not determine drive letter from {device_path!r}.")
+
+
+def _run_eject_windows(device_path, *, close_tray=False):
+    """Eject or load an optical drive tray on Windows via DeviceIoControl."""
+    import ctypes
+
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x80
+    IOCTL_STORAGE_EJECT_MEDIA = 0x002D4808
+    IOCTL_STORAGE_LOAD_MEDIA = 0x002D480C
+
+    # Resolve to \\\\.\\X: format if given a bare drive letter
+    try:
+        drive_root = _windows_drive_root(device_path)
+    except OSError:
+        drive_root = None
+
+    if drive_root and not device_path.startswith("\\\\.\\"):
+        device_path = f"\\\\.\\{drive_root[0]}:"
+
+    handle = ctypes.windll.kernel32.CreateFileW(
+        device_path,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        None,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+
+    if handle in (-1, 0xFFFFFFFF, 18446744073709551615):
+        err = ctypes.GetLastError()
+        if err == 5:
+            raise PermissionError(
+                "Access is denied. Please run as Administrator to eject the disc."
+            )
+        if err == 21:
+            raise OSError("The device is not ready. No disc in the drive?")
+        raise OSError(f"Error opening device (WinError {err}).")
+
+    try:
+        ioctl = IOCTL_STORAGE_LOAD_MEDIA if close_tray else IOCTL_STORAGE_EJECT_MEDIA
+        bytes_returned = ctypes.c_uint32(0)
+        success = ctypes.windll.kernel32.DeviceIoControl(
+            handle,
+            ioctl,
+            None,
+            0,
+            None,
+            0,
+            ctypes.byref(bytes_returned),
+            None,
+        )
+        if not success:
+            err = ctypes.GetLastError()
+            if err == 1167:  # ERROR_NOT_READY
+                raise OSError("The device is not ready. No disc in the drive?")
+            if err == 87:  # ERROR_INVALID_PARAMETER
+                action = "load" if close_tray else "eject"
+                raise OSError(
+                    f"Unable to {action} the tray. "
+                    "The drive may not support software tray control."
+                )
+            raise ctypes.WinError(err)
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+    action = "Closed tray for" if close_tray else "Ejected"
+    return f"{action} {device_path}."
+
+
 def _decode_mount_field(value):
     return (
         value.replace("\\040", " ")
@@ -204,6 +354,12 @@ def _decode_mount_field(value):
 
 
 def find_mount_points_for_source(source_path):
+    if os.name == "nt":
+        try:
+            return [_windows_drive_root(source_path)]
+        except OSError:
+            pass
+
     resolved_source = os.path.realpath(source_path)
     mount_points = []
 
@@ -227,7 +383,34 @@ def find_mount_points_for_source(source_path):
 
 def mount_source_device(source_path):
     if os.name == "nt":
-        raise OSError("Automatic mounting is only supported on Linux.")
+        try:
+            _windows_drive_root(source_path)
+        except OSError:
+            pass
+        else:
+            import ctypes
+
+            drive_root = _windows_drive_root(source_path)
+            # Check whether the volume is ready (has media).
+            # GetDriveTypeW returns 2 (DRIVE_REMOVABLE) or 5 (DRIVE_CDROM)
+            # for optical drives.
+            result = ctypes.windll.kernel32.GetDriveTypeW(drive_root)
+            if result not in (2, 5):  # DRIVE_REMOVABLE or DRIVE_CDROM
+                raise OSError(
+                    f"Cannot access {drive_root}. "
+                    f"The drive may not exist or is not an optical / removable drive."
+                )
+
+            # Verify there is actually media by attempting to stat the root
+            try:
+                os.stat(drive_root)
+            except OSError as exc:
+                raise OSError(
+                    f"No disc detected in {drive_root}. "
+                    "Insert a disc and try again."
+                ) from exc
+
+            return [drive_root]
 
     resolved = os.path.realpath(source_path)
     commands = (

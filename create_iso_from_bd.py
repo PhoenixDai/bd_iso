@@ -418,9 +418,6 @@ def create_iso_from_bd(
     stop_offset_override=None,
     prepare_resume_state=True,
 ):
-    if os.name == "nt":
-        print("Error: create_iso_from_bd.py currently supports Linux only.")
-        return False
     if chunk_size <= 0:
         print("Error: chunk_size must be greater than 0.")
         return False
