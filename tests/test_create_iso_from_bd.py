@@ -396,6 +396,7 @@ class CreateIsoFromBdTests(unittest.TestCase):
                 handle.write(data)
             with open(iso_path, "wb") as handle:
                 handle.write(b"AAAABBBBxxxxYYYYZZZZ")
+            events = []
 
             store = BdIsoStateStore.load_or_hydrate(
                 iso_path,
@@ -421,6 +422,7 @@ class CreateIsoFromBdTests(unittest.TestCase):
                 open_source=lambda _path: source,
                 size_func=lambda _path: len(data),
                 compare_func=lambda *_args, **_kwargs: True,
+                observer=lambda event, **payload: events.append((event, payload)),
             )
 
             self.assertTrue(success)
@@ -432,6 +434,18 @@ class CreateIsoFromBdTests(unittest.TestCase):
             self.assertEqual(store.effective_chunk_status(2), STATUS_COPIED)
             self.assertEqual(store.effective_chunk_status(3), STATUS_COPIED)
             self.assertEqual(store.effective_chunk_status(4), STATUS_COPIED)
+            skipped_progress = [
+                payload
+                for event, payload in events
+                if event == "copy_progress" and payload.get("skipped")
+            ]
+            self.assertEqual(
+                [payload["chunk_index"] for payload in skipped_progress],
+                [3, 4],
+            )
+            self.assertTrue(
+                all(payload["chunk_status"] == STATUS_COPIED for payload in skipped_progress)
+            )
 
 
 if __name__ == "__main__":

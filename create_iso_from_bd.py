@@ -609,10 +609,8 @@ def create_iso_from_bd(
                         state_store is not None
                         and state_store.should_skip_copy_chunk(current_chunk_index)
                     ):
-                        if (
-                            state_store.effective_chunk_status(current_chunk_index)
-                            == STATUS_ZERO_FILLED
-                        ):
+                        skipped_status = state_store.effective_chunk_status(current_chunk_index)
+                        if skipped_status == STATUS_ZERO_FILLED:
                             zero_fill_chunk(iso_file, state_store, current_chunk_index)
                             iso_file.flush()
 
@@ -629,7 +627,20 @@ def create_iso_from_bd(
                             "copy_progress",
                             current=current_offset,
                             total=device_size,
+                            skipped=True,
+                            chunk_index=current_chunk_index,
+                            chunk_status=skipped_status,
                         )
+                        now = time.monotonic()
+                        if now - last_print_time >= 1 or current_offset >= device_size:
+                            print_copy_progress(
+                                current_offset,
+                                device_size,
+                                copy_start_time,
+                                bytes_to_read,
+                                start_offset=start_offset,
+                            )
+                            last_print_time = now
                         continue
 
                     try:

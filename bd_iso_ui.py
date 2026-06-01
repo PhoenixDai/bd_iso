@@ -500,6 +500,17 @@ class BdIsoController:
         if event == "copy_start":
             return "Copy started."
         if event == "copy_progress":
+            if message.get("skipped"):
+                status = message.get("chunk_status")
+                action = (
+                    "Zero-filling marked chunks"
+                    if status == STATUS_ZERO_FILLED
+                    else "Skipping already completed chunks"
+                )
+                return (
+                    f"{action}: {format_bytes(message['current'])} / "
+                    f"{format_bytes(message['total'])}"
+                )
             return (
                 f"Copying {format_bytes(message['current'])} / "
                 f"{format_bytes(message['total'])}"
