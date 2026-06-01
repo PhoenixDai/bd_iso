@@ -320,6 +320,20 @@ class BdIsoStateStore:
         record["sector_scan_complete"] = False
         record["sectors"] = {}
 
+    def _mark_chunk_not_tried(self, chunk_index):
+        record = self.get_chunk_record(chunk_index, create=True)
+        record["status"] = STATUS_NOT_TRIED
+        record["last_error"] = None
+        record["sector_scan_complete"] = False
+        record["sectors"] = {}
+
+    def _mark_chunk_zero_filled(self, chunk_index):
+        record = self.get_chunk_record(chunk_index, create=True)
+        record["status"] = STATUS_ZERO_FILLED
+        record["last_error"] = None
+        record["sector_scan_complete"] = False
+        record["sectors"] = {}
+
     def prepare_resume_from_chunk(self, chunk_index, *, persist=True):
         if chunk_index < 0 or chunk_index >= self.chunk_count:
             raise ValueError("chunk_index is outside the known disc size")
@@ -328,11 +342,7 @@ class BdIsoStateStore:
             status = self.effective_chunk_status(prior_index)
             if status in {STATUS_COPIED, STATUS_VERIFIED, STATUS_ZERO_FILLED}:
                 continue
-            record = self.get_chunk_record(prior_index, create=True)
-            record["status"] = STATUS_ZERO_FILLED
-            record["last_error"] = None
-            record["sector_scan_complete"] = False
-            record["sectors"] = {}
+            self._mark_chunk_zero_filled(prior_index)
 
         self.clear_chunk_record(chunk_index)
         for later_index in range(chunk_index + 1, self.chunk_count):
@@ -341,11 +351,7 @@ class BdIsoStateStore:
                 self._materialize_chunk_status(later_index, status)
                 continue
             if status == STATUS_FAILED:
-                record = self.get_chunk_record(later_index, create=True)
-                record["status"] = STATUS_ZERO_FILLED
-                record["last_error"] = None
-                record["sector_scan_complete"] = False
-                record["sectors"] = {}
+                self._mark_chunk_zero_filled(later_index)
 
         resume_offset = chunk_offset_for_index(chunk_index, self.chunk_size)
         self.state["copy_checkpoint"] = resume_offset
@@ -357,6 +363,50 @@ class BdIsoStateStore:
         if persist:
             self.save()
         return resume_offset
+
+    def prepare_retry_from_chunk(self, chunk_index, *, max_chunks=None, persist=True):
+        if chunk_index < 0 or chunk_index >= self.chunk_count:
+            raise ValueError("chunk_index is outside the known disc size")
+        if max_chunks is not None and max_chunks <= 0:
+            raise ValueError("max_chunks must be greater than 0")
+
+        end_chunk = self.chunk_count
+        if max_chunks is not None:
+            end_chunk = min(self.chunk_count, chunk_index + int(max_chunks))
+
+        for prior_index in range(chunk_index):
+            status = self.effective_chunk_status(prior_index)
+            if status in {STATUS_COPIED, STATUS_VERIFIED, STATUS_ZERO_FILLED}:
+                continue
+            self._mark_chunk_zero_filled(prior_index)
+
+        for retry_index in range(chunk_index, end_chunk):
+            status = self.effective_chunk_status(retry_index)
+            if status in {STATUS_COPIED, STATUS_VERIFIED}:
+                self._materialize_chunk_status(retry_index, status)
+                continue
+            self._mark_chunk_not_tried(retry_index)
+
+        for later_index in range(end_chunk, self.chunk_count):
+            status = self.effective_chunk_status(later_index)
+            if status in {
+                STATUS_COPIED,
+                STATUS_VERIFIED,
+                STATUS_ZERO_FILLED,
+                STATUS_FAILED,
+            }:
+                self._materialize_chunk_status(later_index, status)
+
+        resume_offset = chunk_offset_for_index(chunk_index, self.chunk_size)
+        self.state["copy_checkpoint"] = resume_offset
+        self.state["verify_checkpoint"] = min(
+            self.state["verify_checkpoint"],
+            resume_offset,
+        )
+
+        if persist:
+            self.save()
+        return resume_offset, chunk_offset_for_index(end_chunk, self.chunk_size)
 
     def should_skip_copy_chunk(self, chunk_index):
         return self.effective_chunk_status(chunk_index) in {

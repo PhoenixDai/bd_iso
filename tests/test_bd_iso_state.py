@@ -373,6 +373,37 @@ class BdIsoStateTests(unittest.TestCase):
             self.assertEqual(store.effective_chunk_status(3), STATUS_ZERO_FILLED)
             self.assertEqual(store.effective_chunk_status(4), STATUS_NOT_TRIED)
 
+    def test_prepare_retry_from_chunk_retries_zero_filled_range(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            iso_path = os.path.join(tempdir, "movie.iso")
+            state_path = get_state_path(iso_path)
+            store = BdIsoStateStore.load_or_hydrate(
+                iso_path,
+                source_path="/tmp/disc",
+                device_size=DEFAULT_CHUNK_SIZE * 6,
+                chunk_size=DEFAULT_CHUNK_SIZE,
+                state_path=state_path,
+                reset=True,
+            )
+            store.set_copy_checkpoint(DEFAULT_CHUNK_SIZE * 6)
+            for chunk_index in (2, 3):
+                record = store.get_chunk_record(chunk_index, create=True)
+                record["status"] = STATUS_ZERO_FILLED
+            store.record_copy_failure(DEFAULT_CHUNK_SIZE * 4, DEFAULT_SECTOR_SIZE)
+
+            resume_offset, stop_offset = store.prepare_retry_from_chunk(2, max_chunks=3)
+
+            self.assertEqual(resume_offset, DEFAULT_CHUNK_SIZE * 2)
+            self.assertEqual(stop_offset, DEFAULT_CHUNK_SIZE * 5)
+            self.assertEqual(store.state["copy_checkpoint"], DEFAULT_CHUNK_SIZE * 2)
+            self.assertEqual(store.effective_chunk_status(0), STATUS_COPIED)
+            self.assertEqual(store.effective_chunk_status(1), STATUS_COPIED)
+            self.assertEqual(store.effective_chunk_status(2), STATUS_NOT_TRIED)
+            self.assertEqual(store.effective_chunk_status(3), STATUS_NOT_TRIED)
+            self.assertEqual(store.effective_chunk_status(4), STATUS_NOT_TRIED)
+            self.assertEqual(store.effective_chunk_status(5), STATUS_COPIED)
+            self.assertEqual(store.get_chunk_record(5)["status"], STATUS_COPIED)
+
 
 if __name__ == "__main__":
     unittest.main()

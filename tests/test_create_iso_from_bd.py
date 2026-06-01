@@ -447,6 +447,62 @@ class CreateIsoFromBdTests(unittest.TestCase):
                 all(payload["chunk_status"] == STATUS_COPIED for payload in skipped_progress)
             )
 
+    def test_retry_next_chunks_stops_at_requested_range(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            source_path = os.path.join(tempdir, "disc.bin")
+            iso_path = os.path.join(tempdir, "movie.iso")
+            state_path = get_state_path(iso_path)
+            data = b"AAAABBBBCCCCDDDDEEEEFFFF"
+            source = PlannedSource(data)
+
+            with open(source_path, "wb") as handle:
+                handle.write(data)
+            with open(iso_path, "wb") as handle:
+                handle.write(b"AAAABBBBxxxxyyyyzzzzFFFF")
+
+            store = BdIsoStateStore.load_or_hydrate(
+                iso_path,
+                source_path=source_path,
+                device_size=len(data),
+                chunk_size=4,
+                state_path=state_path,
+                reset=True,
+            )
+            store.set_copy_checkpoint(len(data))
+            for chunk_index in (2, 3, 4):
+                record = store.get_chunk_record(chunk_index, create=True)
+                record["status"] = STATUS_ZERO_FILLED
+            start_offset, stop_offset = store.prepare_retry_from_chunk(2, max_chunks=2)
+            store.save()
+
+            success = create_iso_from_bd(
+                source_path,
+                iso_path,
+                chunk_size=4,
+                retries=0,
+                retry_delay=0,
+                min_read_size=4,
+                resume=True,
+                start_offset_override=start_offset,
+                stop_offset_override=stop_offset,
+                prepare_resume_state=False,
+                state_path=state_path,
+                open_source=lambda _path: source,
+                size_func=lambda _path: len(data),
+                compare_func=lambda *_args, **_kwargs: True,
+            )
+
+            self.assertTrue(success)
+            self.assertEqual(source.read_calls, [(8, 4), (12, 4)])
+            with open(iso_path, "rb") as handle:
+                self.assertEqual(handle.read(), b"AAAABBBBCCCCDDDDzzzzFFFF")
+
+            store = BdIsoStateStore.load(iso_path, state_path=state_path)
+            self.assertEqual(store.effective_chunk_status(2), STATUS_COPIED)
+            self.assertEqual(store.effective_chunk_status(3), STATUS_COPIED)
+            self.assertEqual(store.effective_chunk_status(4), STATUS_ZERO_FILLED)
+            self.assertEqual(store.effective_chunk_status(5), STATUS_COPIED)
+
 
 if __name__ == "__main__":
     unittest.main()

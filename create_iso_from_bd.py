@@ -415,6 +415,8 @@ def create_iso_from_bd(
     cancel_event=None,
     state_path=None,
     start_offset_override=None,
+    stop_offset_override=None,
+    prepare_resume_state=True,
 ):
     if os.name == "nt":
         print("Error: create_iso_from_bd.py currently supports Linux only.")
@@ -439,6 +441,9 @@ def create_iso_from_bd(
         return False
     if start_offset_override is not None and start_offset_override < 0:
         print("Error: start_offset_override cannot be negative.")
+        return False
+    if stop_offset_override is not None and stop_offset_override < 0:
+        print("Error: stop_offset_override cannot be negative.")
         return False
 
     canonical_source = canonicalize_source_path(source_path)
@@ -524,6 +529,13 @@ def create_iso_from_bd(
                     print("Error: start_offset_override is beyond the source size.")
                     return False
                 start_offset = start_offset_override
+            if stop_offset_override is not None:
+                if stop_offset_override > device_size:
+                    print("Error: stop_offset_override is beyond the source size.")
+                    return False
+                if stop_offset_override <= start_offset:
+                    print("Error: stop_offset_override must be after the start offset.")
+                    return False
             progress.checkpoint = start_offset
             write_copy_progress(progress_path, progress)
         except (OSError, ProgressFileError) as exc:
@@ -545,7 +557,11 @@ def create_iso_from_bd(
             chunk_size,
         )
 
-    if state_store is not None and start_offset_override is not None:
+    if (
+        state_store is not None
+        and start_offset_override is not None
+        and prepare_resume_state
+    ):
         state_store.prepare_resume_from_chunk(
             start_offset // chunk_size,
             persist=False,
@@ -562,6 +578,13 @@ def create_iso_from_bd(
         print(
             f"Resuming from checkpoint {start_offset} "
             f"(0x{start_offset:X}) stored in {progress_path}"
+        )
+    copy_end_offset = device_size
+    if stop_offset_override is not None:
+        copy_end_offset = min(device_size, stop_offset_override)
+        print(
+            f"Stopping this run at offset {copy_end_offset} "
+            f"(0x{copy_end_offset:X})"
         )
     emit_observer(
         observer,
@@ -590,7 +613,7 @@ def create_iso_from_bd(
                         start_offset // chunk_size,
                     )
 
-            if start_offset >= device_size:
+            if start_offset >= copy_end_offset:
                 iso_file.truncate(device_size)
                 iso_file.flush()
                 print("ISO copy already complete.")
@@ -599,10 +622,10 @@ def create_iso_from_bd(
                 last_print_time = 0.0
                 current_offset = start_offset
 
-                while current_offset < device_size:
+                while current_offset < copy_end_offset:
                     if is_cancelled(cancel_event):
                         raise KeyboardInterrupt()
-                    bytes_to_read = min(chunk_size, device_size - current_offset)
+                    bytes_to_read = min(chunk_size, copy_end_offset - current_offset)
                     current_chunk_index = current_offset // chunk_size
 
                     if (
@@ -695,7 +718,7 @@ def create_iso_from_bd(
                     )
 
                     now = time.monotonic()
-                    if now - last_print_time >= 1 or current_offset >= device_size:
+                    if now - last_print_time >= 1 or current_offset >= copy_end_offset:
                         print_copy_progress(
                             current_offset,
                             device_size,
@@ -705,20 +728,26 @@ def create_iso_from_bd(
                         )
                         last_print_time = now
 
-                iso_file.truncate(device_size)
-                iso_file.flush()
+                if copy_end_offset >= device_size:
+                    iso_file.truncate(device_size)
+                    iso_file.flush()
                 print()
                 elapsed = max(time.monotonic() - copy_start_time, 1e-9)
                 average_speed = (
-                    max(device_size - start_offset, 0) / (1024**2)
+                    max(copy_end_offset - start_offset, 0) / (1024**2)
                 ) / elapsed
-                print(f"Copy complete in {elapsed:.2f} seconds.")
+                if copy_end_offset >= device_size:
+                    print(f"Copy complete in {elapsed:.2f} seconds.")
+                else:
+                    print(f"Copy range complete in {elapsed:.2f} seconds.")
                 print(f"Average speed: {average_speed:.2f} MB/s")
                 print(f"Copy progress saved to {progress_path}")
                 emit_observer(
                     observer,
                     "copy_complete",
                     total=device_size,
+                    current=copy_end_offset,
+                    range_limited=copy_end_offset < device_size,
                 )
 
     except PermissionError:

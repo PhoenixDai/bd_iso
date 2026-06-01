@@ -399,6 +399,58 @@ class BdIsoController:
             start_offset_override=offset,
         )
 
+    def retry_from_chunk(self, source_path, iso_path, chunk_index):
+        self.load_state(source_path, iso_path)
+        self._validate_fixed_chunk_size()
+        source_path = self.resolve_active_source_path(source_path, iso_path)
+        if self.store is None:
+            raise RuntimeError("No state is loaded.")
+        offset, _stop_offset = self.store.prepare_retry_from_chunk(chunk_index)
+        self._run_in_thread(
+            "retry_from_here",
+            create_iso_from_bd,
+            source_path,
+            iso_path,
+            chunk_size=DEFAULT_CHUNK_SIZE,
+            retries=DEFAULT_RETRIES,
+            retry_delay=DEFAULT_RETRY_DELAY,
+            min_read_size=DEFAULT_MIN_READ_SIZE,
+            resume=True,
+            verify=False,
+            state_path=self._get_state_path(iso_path),
+            start_offset_override=offset,
+            prepare_resume_state=False,
+        )
+
+    def retry_next_chunks(self, source_path, iso_path, chunk_index, chunk_count):
+        self.load_state(source_path, iso_path)
+        self._validate_fixed_chunk_size()
+        source_path = self.resolve_active_source_path(source_path, iso_path)
+        if self.store is None:
+            raise RuntimeError("No state is loaded.")
+        if chunk_count <= 0:
+            raise ValueError("Chunk count must be greater than 0.")
+        offset, stop_offset = self.store.prepare_retry_from_chunk(
+            chunk_index,
+            max_chunks=chunk_count,
+        )
+        self._run_in_thread(
+            "retry_next_chunks",
+            create_iso_from_bd,
+            source_path,
+            iso_path,
+            chunk_size=DEFAULT_CHUNK_SIZE,
+            retries=DEFAULT_RETRIES,
+            retry_delay=DEFAULT_RETRY_DELAY,
+            min_read_size=DEFAULT_MIN_READ_SIZE,
+            resume=True,
+            verify=False,
+            state_path=self._get_state_path(iso_path),
+            start_offset_override=offset,
+            stop_offset_override=stop_offset,
+            prepare_resume_state=False,
+        )
+
     def verify_chunk(self, source_path, iso_path, chunk_index):
         self.load_state(source_path, iso_path)
         self._validate_fixed_chunk_size()
@@ -521,6 +573,8 @@ class BdIsoController:
                 f"({format_bytes(message['size'])})"
             )
         if event == "copy_complete":
+            if message.get("range_limited"):
+                return "Retry range complete."
             return "Copy complete."
         if event == "verify_start":
             return "Verification started."
@@ -548,6 +602,7 @@ class ChunkDetailWindow(tk.Toplevel):
         self.app = app
         self.chunk_index = chunk_index
         self.selected_sector_index = None
+        self.retry_count_var = tk.StringVar(value="5")
         self.title(f"Chunk {chunk_index}")
         set_default_window_size(self, DETAIL_WINDOW_WIDTH, DETAIL_WINDOW_HEIGHT)
         self.resizable(True, True)
@@ -575,6 +630,13 @@ class ChunkDetailWindow(tk.Toplevel):
         )
         self.resume_here_button.pack(side="left", padx=(0, 8))
 
+        self.retry_from_here_button = ttk.Button(
+            action_frame,
+            text="Retry From Here",
+            command=self._retry_from_here,
+        )
+        self.retry_from_here_button.pack(side="left", padx=(0, 8))
+
         self.verify_chunk_button = ttk.Button(
             action_frame,
             text="Verify Chunk",
@@ -597,6 +659,23 @@ class ChunkDetailWindow(tk.Toplevel):
             state="disabled",
         )
         self.verify_sector_button.pack(side="left")
+
+        retry_range_frame = ttk.Frame(self)
+        retry_range_frame.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Label(retry_range_frame, text="Retry next").pack(side="left")
+        self.retry_count_entry = ttk.Entry(
+            retry_range_frame,
+            textvariable=self.retry_count_var,
+            width=6,
+        )
+        self.retry_count_entry.pack(side="left", padx=(6, 6))
+        ttk.Label(retry_range_frame, text="chunks from here").pack(side="left")
+        self.retry_next_button = ttk.Button(
+            retry_range_frame,
+            text="Retry",
+            command=self._retry_next_chunks,
+        )
+        self.retry_next_button.pack(side="left", padx=(8, 0))
 
         selected_label = ttk.Label(self, textvariable=self.selected_var)
         selected_label.pack(fill="x", padx=12, pady=(0, 8))
@@ -681,6 +760,9 @@ class ChunkDetailWindow(tk.Toplevel):
         chunk_state = "normal" if not running else "disabled"
         self.retry_chunk_button.configure(state=chunk_state)
         self.resume_here_button.configure(state=chunk_state)
+        self.retry_from_here_button.configure(state=chunk_state)
+        self.retry_next_button.configure(state=chunk_state)
+        self.retry_count_entry.configure(state=chunk_state)
         self.verify_chunk_button.configure(state=chunk_state)
         self.retry_sector_button.configure(state=sector_state)
         self.verify_sector_button.configure(state=sector_state)
@@ -698,6 +780,28 @@ class ChunkDetailWindow(tk.Toplevel):
             self.app.iso_var.get().strip(),
             self.chunk_index,
         ))
+
+    def _retry_from_here(self):
+        self.app.run_action(lambda: self.app.controller.retry_from_chunk(
+            self.app.device_var.get().strip(),
+            self.app.iso_var.get().strip(),
+            self.chunk_index,
+        ))
+
+    def _retry_next_chunks(self):
+        def action():
+            try:
+                chunk_count = int(self.retry_count_var.get().strip(), 0)
+            except ValueError as exc:
+                raise ValueError("Retry chunk count must be an integer.") from exc
+            self.app.controller.retry_next_chunks(
+                self.app.device_var.get().strip(),
+                self.app.iso_var.get().strip(),
+                self.chunk_index,
+                chunk_count,
+            )
+
+        self.app.run_action(action)
 
     def _verify_chunk(self):
         self.app.run_action(lambda: self.app.controller.verify_chunk(
