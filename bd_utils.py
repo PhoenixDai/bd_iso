@@ -229,19 +229,21 @@ def auto_detect_optical_drive(preferred_path=None, expected_size=None):
 
 def resolve_source_path(source_path, expected_size=None):
     if os.name == "nt":
-        # If a specific existing path is given (e.g. a regular file), use it
-        if source_path and os.path.exists(source_path):
-            return os.path.realpath(source_path)
-        # If it already looks like a Windows device path, use it directly
-        if source_path and source_path.startswith("\\\\.\\"):
-            return source_path
-        # Try parsing as a drive letter (D:, D:\, D) — convert to \\.\X:
         if source_path:
+            # If it already looks like a Windows device path, use it directly
+            if source_path.startswith("\\\\.\\"):
+                return source_path
+            # If it's a bare drive letter (D:, D:\, D), convert to \\.\X:
+            # Must check BEFORE os.path.exists because E: resolves to E:\
+            # (a valid filesystem path) but we want the raw device handle.
             try:
                 drive_root = _windows_drive_root(source_path)
                 return f"\\\\.\\{drive_root[0]}:"
             except OSError:
                 pass
+        # Regular filesystem path that exists
+        if source_path and os.path.exists(source_path):
+            return os.path.realpath(source_path)
         # Auto-detect: enumerate CD-ROM drives
         return auto_detect_optical_drive(
             preferred_path=source_path or None,
@@ -557,7 +559,6 @@ def open_bd_drive(bd_path):
     """
     if os.name == "nt":
         import ctypes
-        import msvcrt
 
         # Resolve to the raw device path for reliable sustained reads
         try:
@@ -569,7 +570,6 @@ def open_bd_drive(bd_path):
         FILE_SHARE_READ = 0x00000001
         FILE_SHARE_WRITE = 0x00000002
         OPEN_EXISTING = 3
-        FILE_ATTRIBUTE_NORMAL = 0x80
 
         handle = ctypes.windll.kernel32.CreateFileW(
             bd_path,
@@ -577,18 +577,89 @@ def open_bd_drive(bd_path):
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
+            0,
             None,
         )
 
-        if handle == -1 or handle == 0xFFFFFFFF or handle == 18446744073709551615:
+        if handle in (-1, 0xFFFFFFFF, 18446744073709551615):
             err = ctypes.GetLastError()
             if err == 5:
                 raise PermissionError("Access is denied. Please run as Administrator.")
             raise OSError(f"Error opening drive (WinError {err}).")
 
-        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
-        return os.fdopen(fd, "rb")
+        # Use direct Win32 ReadFile/SetFilePointerEx to avoid Python's
+        # buffered I/O layer, which can cause handle instability on raw
+        # optical drive devices during sustained sequential reads.
+        return _RawDeviceFile(handle)
 
     bd_path = resolve_source_path(bd_path)
     return open(bd_path, "rb")
+
+
+class _RawDeviceFile:
+    """A file-like object backed by direct Win32 ReadFile / SetFilePointerEx.
+
+    Bypasses Python's io.BufferedReader and the C runtime's file buffering,
+    which are not designed for raw device handles and cause handle failures
+    during sustained sequential reads on optical drives.
+    """
+
+    def __init__(self, handle):
+        self._handle = handle
+        self._pos = 0
+
+    def seek(self, offset, whence=0):
+        import ctypes
+
+        if whence == 0:  # SEEK_SET
+            new_pos = offset
+        elif whence == 1:  # SEEK_CUR
+            new_pos = self._pos + offset
+        elif whence == 2:  # SEEK_END
+            raise OSError("SEEK_END not supported on raw devices")
+        else:
+            raise ValueError(f"Invalid whence: {whence}")
+
+        li_offset = ctypes.c_longlong(new_pos)
+        result = ctypes.windll.kernel32.SetFilePointerEx(
+            self._handle, li_offset, None, 0  # FILE_BEGIN
+        )
+        if not result:
+            raise ctypes.WinError()
+        self._pos = new_pos
+        return self._pos
+
+    def read(self, size=-1):
+        import ctypes
+
+        if size < 0:
+            raise OSError("Reading to end not supported on raw devices")
+        if size == 0:
+            return b""
+
+        buf = ctypes.create_string_buffer(size)
+        bytes_read = ctypes.c_uint32(0)
+        success = ctypes.windll.kernel32.ReadFile(
+            self._handle,
+            buf,
+            size,
+            ctypes.byref(bytes_read),
+            None,
+        )
+        if not success:
+            raise ctypes.WinError()
+        self._pos += bytes_read.value
+        return buf.raw[: bytes_read.value]
+
+    def close(self):
+        import ctypes
+
+        if self._handle is not None:
+            ctypes.windll.kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()

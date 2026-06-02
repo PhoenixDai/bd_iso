@@ -126,8 +126,14 @@ def normalize_bd_path(drive_letter):
         # Already a full device path — return as-is
         if stripped.startswith("\\\\.\\"):
             return stripped
-        drive_letter = stripped.upper().strip(":").strip("\\").strip("/")
-        return f"\\\\.\\{drive_letter}:"
+        # Bare drive letter (D, D:, D:\) — convert to \\\\.\\D:
+        cleaned = stripped.rstrip(":\\/")
+        if len(cleaned) == 1 and cleaned.isalpha():
+            return f"\\\\.\\{cleaned.upper()}:"
+        # Regular file path — resolve and return as-is
+        if os.path.exists(stripped):
+            return os.path.realpath(stripped)
+        return stripped
     return resolve_source_path(drive_letter)
 
 
