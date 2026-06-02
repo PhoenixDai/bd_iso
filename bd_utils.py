@@ -330,10 +330,10 @@ def _run_eject_windows(device_path, *, close_tray=False):
     import ctypes
 
     GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
     FILE_SHARE_READ = 0x00000001
     FILE_SHARE_WRITE = 0x00000002
     OPEN_EXISTING = 3
-    FILE_ATTRIBUTE_NORMAL = 0x80
     IOCTL_STORAGE_EJECT_MEDIA = 0x002D4808
     IOCTL_STORAGE_LOAD_MEDIA = 0x002D480C
 
@@ -346,13 +346,14 @@ def _run_eject_windows(device_path, *, close_tray=False):
     if drive_root and not device_path.startswith("\\\\.\\"):
         device_path = f"\\\\.\\{drive_root[0]}:"
 
+    # Eject / load require write access to the device
     handle = ctypes.windll.kernel32.CreateFileW(
         device_path,
-        GENERIC_READ,
+        GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         None,
         OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
+        0,  # No file attributes for device handles
         None,
     )
 
