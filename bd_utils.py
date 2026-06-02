@@ -326,73 +326,36 @@ def _windows_drive_root(device_path):
 
 
 def _run_eject_windows(device_path, *, close_tray=False):
-    """Eject or load an optical drive tray on Windows via DeviceIoControl."""
+    """Eject or load an optical drive tray on Windows via MCI."""
     import ctypes
 
-    GENERIC_READ = 0x80000000
-    GENERIC_WRITE = 0x40000000
-    FILE_SHARE_READ = 0x00000001
-    FILE_SHARE_WRITE = 0x00000002
-    OPEN_EXISTING = 3
-    IOCTL_STORAGE_EJECT_MEDIA = 0x002D4808
-    IOCTL_STORAGE_LOAD_MEDIA = 0x002D480C
+    drive_root = _windows_drive_root(device_path)
+    drive_letter = drive_root[0]  # e.g. "E"
 
-    # Resolve to \\\\.\\X: format if given a bare drive letter
-    try:
-        drive_root = _windows_drive_root(device_path)
-    except OSError:
-        drive_root = None
+    # MCI commands are the reliable way to control optical drive trays
+    alias = f"bd_{drive_letter}"
+    winmm = ctypes.WinDLL("winmm")
+    mci = winmm.mciSendStringW
+    mci_error = winmm.mciGetErrorStringW
 
-    if drive_root and not device_path.startswith("\\\\.\\"):
-        device_path = f"\\\\.\\{drive_root[0]}:"
-
-    # Eject / load require write access to the device
-    handle = ctypes.windll.kernel32.CreateFileW(
-        device_path,
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        None,
-        OPEN_EXISTING,
-        0,  # No file attributes for device handles
-        None,
-    )
-
-    if handle in (-1, 0xFFFFFFFF, 18446744073709551615):
-        err = ctypes.GetLastError()
-        if err == 5:
-            raise PermissionError(
-                "Access is denied. Please run as Administrator to eject the disc."
-            )
-        if err == 21:
-            raise OSError("The device is not ready. No disc in the drive?")
-        raise OSError(f"Error opening device (WinError {err}).")
+    def mci_command(cmd):
+        """Send an MCI command; raise OSError on failure."""
+        result = mci(cmd, None, 0, None)
+        if result != 0:
+            buf = ctypes.create_unicode_buffer(256)
+            mci_error(result, buf, 256)
+            raise OSError(buf.value or f"MCI error {result}")
 
     try:
-        ioctl = IOCTL_STORAGE_LOAD_MEDIA if close_tray else IOCTL_STORAGE_EJECT_MEDIA
-        bytes_returned = ctypes.c_uint32(0)
-        success = ctypes.windll.kernel32.DeviceIoControl(
-            handle,
-            ioctl,
-            None,
-            0,
-            None,
-            0,
-            ctypes.byref(bytes_returned),
-            None,
-        )
-        if not success:
-            err = ctypes.GetLastError()
-            if err == 1167:  # ERROR_NOT_READY
-                raise OSError("The device is not ready. No disc in the drive?")
-            if err == 87:  # ERROR_INVALID_PARAMETER
-                action = "load" if close_tray else "eject"
-                raise OSError(
-                    f"Unable to {action} the tray. "
-                    "The drive may not support software tray control."
-                )
-            raise ctypes.WinError(err)
+        mci_command(f"open {drive_letter}: type cdaudio alias {alias}")
+        action = "set {alias} door closed" if close_tray else f"set {alias} door open"
+        mci_command(action)
     finally:
-        ctypes.windll.kernel32.CloseHandle(handle)
+        # Always try to close the MCI device; ignore errors during cleanup
+        try:
+            mci(f"close {alias}", None, 0, None)
+        except Exception:
+            pass
 
     action = "Closed tray for" if close_tray else "Ejected"
     return f"{action} {device_path}."
