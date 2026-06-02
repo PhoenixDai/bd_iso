@@ -18,6 +18,10 @@ TOUCH_MAX_CANDIDATE_FILES = 512
 def is_optical_device_path(device_path):
     if not device_path:
         return False
+    if os.name == "nt":
+        stripped = device_path.strip()
+        if stripped.startswith("\\\\.\\"):
+            return True
     normalized = os.path.realpath(device_path)
     base_name = os.path.basename(normalized)
     return (
@@ -29,6 +33,25 @@ def is_optical_device_path(device_path):
 
 
 def list_optical_drive_candidates():
+    """Return a list of likely optical drive device paths for the current OS."""
+    if os.name == "nt":
+        import ctypes
+
+        DRIVE_CDROM = 5
+        candidates = []
+        seen = set()
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+        for letter_index in range(26):
+            if bitmask & (1 << letter_index):
+                letter = chr(ord("A") + letter_index)
+                root = f"{letter}:\\"
+                if ctypes.windll.kernel32.GetDriveTypeW(root) == DRIVE_CDROM:
+                    device_path = f"\\\\.\\{letter}:"
+                    if device_path not in seen:
+                        candidates.append(device_path)
+                        seen.add(device_path)
+        return candidates
+
     candidates = []
     seen = set()
 
@@ -164,18 +187,28 @@ def get_block_device_size(device_path):
 def auto_detect_optical_drive(preferred_path=None, expected_size=None):
     candidate_paths = []
     seen = set()
+    is_windows = os.name == "nt"
 
     def add_candidate(path):
         if not path:
             return
-        resolved = os.path.realpath(path)
-        if resolved in seen or not os.path.exists(resolved):
-            return
+        if is_windows and path.startswith("\\\\.\\"):
+            # Windows device paths don't work with os.path.realpath / os.path.exists
+            resolved = path
+            if resolved in seen:
+                return
+        else:
+            resolved = os.path.realpath(path)
+            if resolved in seen or not os.path.exists(resolved):
+                return
         seen.add(resolved)
         candidate_paths.append(resolved)
 
-    if preferred_path and os.path.exists(preferred_path):
-        add_candidate(preferred_path)
+    if preferred_path:
+        if is_windows and preferred_path.startswith("\\\\.\\"):
+            add_candidate(preferred_path)
+        elif os.path.exists(preferred_path):
+            add_candidate(preferred_path)
 
     for candidate in list_optical_drive_candidates():
         add_candidate(candidate)
@@ -196,7 +229,24 @@ def auto_detect_optical_drive(preferred_path=None, expected_size=None):
 
 def resolve_source_path(source_path, expected_size=None):
     if os.name == "nt":
-        return source_path
+        # If a specific existing path is given (e.g. a regular file), use it
+        if source_path and os.path.exists(source_path):
+            return os.path.realpath(source_path)
+        # If it already looks like a Windows device path, use it directly
+        if source_path and source_path.startswith("\\\\.\\"):
+            return source_path
+        # Try parsing as a drive letter (D:, D:\, D) — convert to \\.\X:
+        if source_path:
+            try:
+                drive_root = _windows_drive_root(source_path)
+                return f"\\\\.\\{drive_root[0]}:"
+            except OSError:
+                pass
+        # Auto-detect: enumerate CD-ROM drives
+        return auto_detect_optical_drive(
+            preferred_path=source_path or None,
+            expected_size=expected_size,
+        )
 
     if source_path and os.path.exists(source_path):
         return os.path.realpath(source_path)
