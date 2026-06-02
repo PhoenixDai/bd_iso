@@ -1050,6 +1050,7 @@ class BdIsoApp(tk.Tk):
             self.summary_var.set("No state loaded.")
             self.page_var.set("Page 0 / 0")
             self.canvas.delete("all")
+            self._refresh_buttons()
             return
 
         counts = store.summarize_counts()
