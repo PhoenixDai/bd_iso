@@ -215,7 +215,10 @@ def run_eject_command(device_path, *, close_tray=False):
         try:
             _windows_drive_root(device_path)
         except OSError:
-            pass
+            raise OSError(
+                f"Cannot determine a Windows drive from {device_path!r}. "
+                "Pass a drive letter like D:, D:\\, or \\\\.\\D:."
+            )
         else:
             return _run_eject_windows(device_path, close_tray=close_tray)
 
