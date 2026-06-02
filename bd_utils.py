@@ -514,13 +514,38 @@ def touch_disc(device_path, *, expected_size=None, rng=random):
     raise OSError(f"Could not touch mounted disc {resolved}: {details}")
 
 
+def _resolve_windows_device_path(bd_path):
+    """Convert a Windows drive letter or volume path to a raw device path.
+
+    ``\\\\.\\E:``  →  ``\\\\.\\CdRom0``  (or whatever the underlying device is)
+    ``E:``         →  ``\\\\.\\CdRom0``
+    """
+    import ctypes
+
+    drive_root = _windows_drive_root(bd_path)
+    drive_letter = drive_root[0]  # e.g. "E"
+
+    # QueryDosDeviceW maps a DOS drive letter to its NT device path
+    buf = ctypes.create_unicode_buffer(260)
+    result = ctypes.windll.kernel32.QueryDosDeviceW(
+        f"{drive_letter}:", buf, 260
+    )
+    if result == 0:
+        # QueryDosDevice failed; fall back to the volume path
+        return f"\\\\.\\{drive_letter}:"
+
+    nt_path = buf.value  # e.g. "\\Device\\CdRom0"
+    device_name = nt_path.rstrip("\\").split("\\")[-1]  # e.g. "CdRom0"
+    return f"\\\\.\\{device_name}"
+
+
 def open_bd_drive(bd_path):
     """
     Opens a BD drive for reading on Windows or Unix systems.
 
     Args:
         bd_path (str): The device path of the BD drive.
-                      On Windows: r'\\\\.\\D:' format
+                      On Windows: r'\\\\.\\D:' or 'D:' format
                       On Unix: '/dev/sr0' format
 
     Returns:
@@ -533,6 +558,12 @@ def open_bd_drive(bd_path):
     if os.name == "nt":
         import ctypes
         import msvcrt
+
+        # Resolve to the raw device path for reliable sustained reads
+        try:
+            bd_path = _resolve_windows_device_path(bd_path)
+        except OSError:
+            pass  # Keep the original path if resolution fails
 
         GENERIC_READ = 0x80000000
         FILE_SHARE_READ = 0x00000001
