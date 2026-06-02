@@ -122,7 +122,11 @@ def print_progress_bar(current, total, speed_mb_s, bar_length=40):
 
 def normalize_bd_path(drive_letter):
     if os.name == "nt":
-        drive_letter = drive_letter.upper().strip(":").strip("\\").strip("/")
+        stripped = drive_letter.strip()
+        # Already a full device path — return as-is
+        if stripped.startswith("\\\\.\\"):
+            return stripped
+        drive_letter = stripped.upper().strip(":").strip("\\").strip("/")
         return f"\\\\.\\{drive_letter}:"
     return resolve_source_path(drive_letter)
 
