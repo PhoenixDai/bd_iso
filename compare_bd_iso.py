@@ -417,149 +417,170 @@ def compare_bd_to_iso(
     )
 
     try:
-        with open_source(bd_path) as bd_file, open(iso_path, "rb") as iso_file:
-            if start_offset > 0:
-                bd_file.seek(start_offset)
-                iso_file.seek(start_offset)
+        bd_file = open_source(bd_path)
+        try:
+            with open(iso_path, "rb") as iso_file:
+                if start_offset > 0:
+                    bd_file.seek(start_offset)
+                    iso_file.seek(start_offset)
 
-            start_time = time.monotonic()
-            last_print_time = start_time
-            last_checkpoint_time = start_time
-            bytes_processed_this_run = 0
-            mismatch_count = 0
-            mismatch_offsets = []
+                start_time = time.monotonic()
+                last_print_time = start_time
+                last_checkpoint_time = start_time
+                bytes_processed_this_run = 0
+                mismatch_count = 0
+                mismatch_offsets = []
 
-            print_progress_bar(bytes_read, iso_size, 0)
+                print_progress_bar(bytes_read, iso_size, 0)
 
-            while True:
-                if is_cancelled(cancel_event):
-                    raise KeyboardInterrupt()
-                if mismatch_count >= max_mismatches:
-                    print(
-                        f"\nReached {max_mismatches} chunk mismatches, "
-                        "stopping this run."
-                    )
-                    break
-
-                iso_chunk = iso_file.read(chunk_size)
-                if not iso_chunk:
-                    last_verified_offset = bytes_read
-                    break
-
-                bd_file.seek(bytes_read)
-                iso_file.seek(bytes_read)
-                result = compare_range_between_handles(
-                    bd_file,
-                    iso_file,
-                    bytes_read,
-                    len(iso_chunk),
-                    sector_size=sector_size,
-                    observer=observer,
-                    cancel_event=cancel_event,
-                )
-
-                if not result.matches:
-                    mismatch_offset = bytes_read
-                    print(
-                        f"\n[!] Chunk mismatch at offset {mismatch_offset} "
-                        f"(0x{mismatch_offset:X}); first differing byte at "
-                        f"{result.first_diff_offset} (0x{result.first_diff_offset:X}); "
-                        f"{result.mismatching_bytes} mismatching bytes in chunk"
-                    )
-                    save_mismatch(iso_path, mismatch_offset)
-                    mismatch_offsets.append(mismatch_offset)
-                    mismatch_count += 1
-                    if state_store is not None:
-                        state_store.record_sector_scan(
-                            mismatch_offset // chunk_size,
-                            result.sector_statuses,
+                while True:
+                    if is_cancelled(cancel_event):
+                        raise KeyboardInterrupt()
+                    if mismatch_count >= max_mismatches:
+                        print(
+                            f"\nReached {max_mismatches} chunk mismatches, "
+                            "stopping this run."
                         )
-                    emit_observer(
-                        observer,
-                        "verify_chunk_failed",
-                        offset=mismatch_offset,
-                        size=len(iso_chunk),
-                        first_diff_offset=result.first_diff_offset,
-                        mismatching_bytes=result.mismatching_bytes,
-                    )
-                else:
-                    last_verified_offset = bytes_read + len(iso_chunk)
-                    if state_store is not None:
-                        state_store.record_verify_success(
+                        break
+
+                    iso_chunk = iso_file.read(chunk_size)
+                    if not iso_chunk:
+                        last_verified_offset = bytes_read
+                        break
+
+                    try:
+                        bd_file.seek(bytes_read)
+                        iso_file.seek(bytes_read)
+                        result = compare_range_between_handles(
+                            bd_file,
+                            iso_file,
                             bytes_read,
                             len(iso_chunk),
+                            sector_size=sector_size,
+                            observer=observer,
+                            cancel_event=cancel_event,
                         )
+                    except (PermissionError, OSError):
+                        # The BD handle may become stale on Windows;
+                        # close it, re-open, and retry once.
+                        bd_file.close()
+                        bd_file = open_source(bd_path)
+                        bd_file.seek(bytes_read)
+                        iso_file.seek(bytes_read)
+                        result = compare_range_between_handles(
+                            bd_file,
+                            iso_file,
+                            bytes_read,
+                            len(iso_chunk),
+                            sector_size=sector_size,
+                            observer=observer,
+                            cancel_event=cancel_event,
+                        )
+
+                    if not result.matches:
+                        mismatch_offset = bytes_read
+                        print(
+                            f"\n[!] Chunk mismatch at offset {mismatch_offset} "
+                            f"(0x{mismatch_offset:X}); first differing byte at "
+                            f"{result.first_diff_offset} (0x{result.first_diff_offset:X}); "
+                            f"{result.mismatching_bytes} mismatching bytes in chunk"
+                        )
+                        save_mismatch(iso_path, mismatch_offset)
+                        mismatch_offsets.append(mismatch_offset)
+                        mismatch_count += 1
+                        if state_store is not None:
+                            state_store.record_sector_scan(
+                                mismatch_offset // chunk_size,
+                                result.sector_statuses,
+                            )
+                        emit_observer(
+                            observer,
+                            "verify_chunk_failed",
+                            offset=mismatch_offset,
+                            size=len(iso_chunk),
+                            first_diff_offset=result.first_diff_offset,
+                            mismatching_bytes=result.mismatching_bytes,
+                        )
+                    else:
+                        last_verified_offset = bytes_read + len(iso_chunk)
+                        if state_store is not None:
+                            state_store.record_verify_success(
+                                bytes_read,
+                                len(iso_chunk),
+                            )
+                        emit_observer(
+                            observer,
+                            "verify_chunk_verified",
+                            offset=bytes_read,
+                            size=len(iso_chunk),
+                        )
+
+                    bytes_read += len(result.iso_bytes)
+                    bytes_processed_this_run += len(result.iso_bytes)
+
+                    current_time = time.monotonic()
+                    if current_time - last_checkpoint_time >= 1:
+                        save_checkpoint(iso_path, last_verified_offset)
+                        last_checkpoint_time = current_time
+
+                    if current_time - last_print_time >= 1:
+                        elapsed = current_time - start_time
+                        speed = (
+                            (bytes_processed_this_run / (1024**2)) / elapsed
+                            if elapsed > 0
+                            else 0
+                        )
+                        print_progress_bar(bytes_read, iso_size, speed)
+                        last_print_time = current_time
                     emit_observer(
                         observer,
-                        "verify_chunk_verified",
-                        offset=bytes_read,
-                        size=len(iso_chunk),
+                        "verify_progress",
+                        current=bytes_read,
+                        total=iso_size,
+                        last_verified_offset=last_verified_offset,
+                        mismatches=mismatch_count,
                     )
 
-                bytes_read += len(result.iso_bytes)
-                bytes_processed_this_run += len(result.iso_bytes)
-
-                current_time = time.monotonic()
-                if current_time - last_checkpoint_time >= 1:
-                    save_checkpoint(iso_path, last_verified_offset)
-                    last_checkpoint_time = current_time
-
-                if current_time - last_print_time >= 1:
-                    elapsed = current_time - start_time
-                    speed = (
-                        (bytes_processed_this_run / (1024**2)) / elapsed
-                        if elapsed > 0
-                        else 0
-                    )
-                    print_progress_bar(bytes_read, iso_size, speed)
-                    last_print_time = current_time
-                emit_observer(
-                    observer,
-                    "verify_progress",
-                    current=bytes_read,
-                    total=iso_size,
-                    last_verified_offset=last_verified_offset,
-                    mismatches=mismatch_count,
+                elapsed = time.monotonic() - start_time
+                average_speed = (
+                    (bytes_processed_this_run / (1024**2)) / elapsed if elapsed > 0 else 0
+                )
+                print_progress_bar(bytes_read, iso_size, average_speed)
+                print("\n")
+                print(f"Run complete. {mismatch_count} mismatches logged this run.")
+                print(f"Total time for this run: {elapsed:.2f} seconds")
+                print(f"Average speed: {average_speed:.2f} MB/s")
+                print(
+                    f"Last verified matching offset: {last_verified_offset} "
+                    f"(0x{last_verified_offset:X})"
                 )
 
-            elapsed = time.monotonic() - start_time
-            average_speed = (
-                (bytes_processed_this_run / (1024**2)) / elapsed if elapsed > 0 else 0
-            )
-            print_progress_bar(bytes_read, iso_size, average_speed)
-            print("\n")
-            print(f"Run complete. {mismatch_count} mismatches logged this run.")
-            print(f"Total time for this run: {elapsed:.2f} seconds")
-            print(f"Average speed: {average_speed:.2f} MB/s")
-            print(
-                f"Last verified matching offset: {last_verified_offset} "
-                f"(0x{last_verified_offset:X})"
-            )
-
-            if mismatch_offsets:
-                preview = ", ".join(
-                    f"{offset} (0x{offset:X})" for offset in mismatch_offsets[:5]
-                )
-                print(f"First mismatch offsets from this run: {preview}")
-                if len(mismatch_offsets) > 5:
-                    print(
-                        f"... plus {len(mismatch_offsets) - 5} more. "
-                        f"See {get_progress_file_path(iso_path)}."
+                if mismatch_offsets:
+                    preview = ", ".join(
+                        f"{offset} (0x{offset:X})" for offset in mismatch_offsets[:5]
                     )
+                    print(f"First mismatch offsets from this run: {preview}")
+                    if len(mismatch_offsets) > 5:
+                        print(
+                            f"... plus {len(mismatch_offsets) - 5} more. "
+                            f"See {get_progress_file_path(iso_path)}."
+                        )
 
-            if mismatch_count == 0:
-                print("\nSuccess: BD disc matches ISO file perfectly up to the ISO size!")
-                clear_progress(iso_path)
-                emit_observer(observer, "verify_complete", success=True)
-                return True
+                if mismatch_count == 0:
+                    print("\nSuccess: BD disc matches ISO file perfectly up to the ISO size!")
+                    clear_progress(iso_path)
+                    emit_observer(observer, "verify_complete", success=True)
+                    return True
 
-            save_checkpoint(iso_path, last_verified_offset)
-            print(
-                f"Progress and mismatch offsets saved to "
-                f"{get_progress_file_path(iso_path)}."
-            )
-            emit_observer(observer, "verify_complete", success=False)
-            return False
+                save_checkpoint(iso_path, last_verified_offset)
+                print(
+                    f"Progress and mismatch offsets saved to "
+                    f"{get_progress_file_path(iso_path)}."
+                )
+                emit_observer(observer, "verify_complete", success=False)
+                return False
+        finally:
+            bd_file.close()
 
     except PermissionError:
         print("\n\nError: Permission denied.")
