@@ -348,9 +348,15 @@ def _run_eject_windows(device_path, *, close_tray=False):
             mci_error(result, buf, 256)
             raise OSError(buf.value or f"MCI error {result}")
 
+    # Open the device.  Try without type first (works when no disc is
+    # present), then fall back to ``type cdaudio``.
     try:
+        mci_command(f"open {drive_letter}: alias {alias}")
+    except OSError:
         mci_command(f"open {drive_letter}: type cdaudio alias {alias}")
-        action = "set {alias} door closed" if close_tray else f"set {alias} door open"
+
+    try:
+        action = f"set {alias} door closed" if close_tray else f"set {alias} door open"
         mci_command(action)
     finally:
         # Always try to close the MCI device; ignore errors during cleanup
